@@ -324,6 +324,15 @@ func (c *Client) Get(dst []byte, url string) (statusCode int, body []byte, err e
 	return clientGetURL(dst, url, c)
 }
 
+func (c *Client) GetWithRequest(req *Request, dst []byte) (statusCode int, body []byte, err error) {
+	return doRequestFollowRedirectsBuffer(req, dst, req.URI().String(), c)
+}
+
+func (c *Client) GetWithRequestTimeout(req *Request, dst []byte, timeout time.Duration) (statusCode int, body []byte, err error) {
+	deadline := time.Now().Add(timeout)
+	return clientWithRequestGetURLDeadline(req, dst, deadline, c)
+}
+
 // GetTimeout returns the status code and body of url.
 //
 // The contents of dst will be replaced by the body and returned, if the dst
@@ -901,6 +910,15 @@ func (c *HostClient) GetTimeout(dst []byte, url string, timeout time.Duration) (
 	return clientGetURLTimeout(dst, url, timeout, c)
 }
 
+func (c *HostClient) GetWithRequest(req *Request, dst []byte) (statusCode int, body []byte, err error) {
+	return doRequestFollowRedirectsBuffer(req, dst, req.URI().String(), c)
+}
+
+func (c *HostClient) GetWithRequestTimeout(req *Request, dst []byte, timeout time.Duration) (statusCode int, body []byte, err error) {
+	deadline := time.Now().Add(timeout)
+	return clientWithRequestGetURLDeadline(req, dst, deadline, c)
+}
+
 // GetDeadline returns the status code and body of url.
 //
 // The contents of dst will be replaced by the body and returned, if the dst
@@ -1019,6 +1037,72 @@ func clientGetURLDeadline(dst []byte, url string, deadline time.Time, c clientDo
 	return statusCode, body, err
 }
 
+func clientWithRequestGetURLDeadline(req *Request, dst []byte, deadline time.Time, c clientDoer) (statusCode int, body []byte, err error) {
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		return 0, dst, ErrTimeout
+	}
+	req.SetTimeout(timeout)
+
+	var ch chan clientURLResponse
+	chv := clientURLResponseChPool.Get()
+	if chv == nil {
+		chv = make(chan clientURLResponse, 1)
+	}
+	ch = chv.(chan clientURLResponse)
+
+	// Note that the request continues execution on ErrTimeout until
+	// client-specific ReadTimeout exceeds. This helps limiting load
+	// on slow hosts by MaxConns* concurrent requests.
+	//
+	// Without this 'hack' the load on slow host could exceed MaxConns*
+	// concurrent requests, since timed out requests on client side
+	// usually continue execution on the host.
+
+	var mu sync.Mutex
+	var timedout, responded bool
+
+	go func() {
+		statusCodeCopy, bodyCopy, errCopy := doRequestFollowRedirectsBuffer(req, dst, req.URI().String(), c)
+		mu.Lock()
+		if !timedout {
+			ch <- clientURLResponse{
+				statusCode: statusCodeCopy,
+				body:       bodyCopy,
+				err:        errCopy,
+			}
+			responded = true
+		}
+		mu.Unlock()
+	}()
+
+	tc := AcquireTimer(timeout)
+	select {
+	case resp := <-ch:
+		statusCode = resp.statusCode
+		body = resp.body
+		err = resp.err
+	case <-tc.C:
+		mu.Lock()
+		if responded {
+			resp := <-ch
+			statusCode = resp.statusCode
+			body = resp.body
+			err = resp.err
+		} else {
+			timedout = true
+			err = ErrTimeout
+			body = dst
+		}
+		mu.Unlock()
+	}
+	ReleaseTimer(tc)
+
+	clientURLResponseChPool.Put(chv)
+
+	return statusCode, body, err
+}
+
 var clientURLResponseChPool sync.Pool
 
 func clientPostURL(dst []byte, url string, postArgs *Args, c clientDoer) (statusCode int, body []byte, err error) {
@@ -1056,15 +1140,19 @@ const defaultMaxRedirectsCount = 16
 func doRequestFollowRedirectsBuffer(req *Request, dst []byte, url string, c clientDoer) (statusCode int, body []byte, err error) {
 	resp := AcquireResponse()
 	bodyBuf := resp.bodyBuffer()
-	resp.keepBodyBuffer = true
-	oldBody := bodyBuf.B
-	bodyBuf.B = dst
+	var oldBody []byte
+	if dst != nil {
+		resp.keepBodyBuffer = true
+		oldBody = bodyBuf.B
+		bodyBuf.B = dst
+	}
 
 	statusCode, _, err = doRequestFollowRedirects(req, resp, url, defaultMaxRedirectsCount, c)
-
-	body = bodyBuf.B
-	bodyBuf.B = oldBody
-	resp.keepBodyBuffer = false
+	if dst != nil {
+		body = bodyBuf.B
+		bodyBuf.B = oldBody
+		resp.keepBodyBuffer = false
+	}
 	ReleaseResponse(resp)
 
 	return statusCode, body, err
@@ -2882,120 +2970,3 @@ var errPipelineConnStopped = errors.New("pipeline connection has been stopped")
 var DefaultTransport RoundTripper = &transport{}
 
 type transport struct{}
-
-func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (retry bool, err error) {
-	customSkipBody := resp.SkipBody
-	customStreamBody := resp.StreamBody
-
-	var deadline time.Time
-	if req.timeout > 0 {
-		deadline = time.Now().Add(req.timeout)
-	}
-
-	cc, err := hc.acquireConn(req.timeout, req.ConnectionClose())
-	if err != nil {
-		return false, err
-	}
-	conn := cc.c
-
-	resp.parseNetConn(conn)
-
-	writeDeadline := deadline
-	if hc.WriteTimeout > 0 {
-		tmpWriteDeadline := time.Now().Add(hc.WriteTimeout)
-		if writeDeadline.IsZero() || tmpWriteDeadline.Before(writeDeadline) {
-			writeDeadline = tmpWriteDeadline
-		}
-	}
-
-	if err = conn.SetWriteDeadline(writeDeadline); err != nil {
-		hc.closeConn(cc)
-		return true, err
-	}
-
-	resetConnection := false
-	if hc.MaxConnDuration > 0 && time.Since(cc.createdTime) > hc.MaxConnDuration && !req.ConnectionClose() {
-		req.SetConnectionClose()
-		resetConnection = true
-	}
-
-	bw := hc.acquireWriter(conn)
-	err = req.Write(bw)
-
-	if resetConnection {
-		req.Header.ResetConnectionClose()
-	}
-
-	if err == nil {
-		err = bw.Flush()
-	}
-	hc.releaseWriter(bw)
-
-	// Return ErrTimeout on any timeout.
-	if x, ok := err.(interface{ Timeout() bool }); ok && x.Timeout() {
-		err = ErrTimeout
-	}
-
-	isConnRST := isConnectionReset(err)
-	if err != nil && !isConnRST {
-		hc.closeConn(cc)
-		return true, err
-	}
-
-	readDeadline := deadline
-	if hc.ReadTimeout > 0 {
-		tmpReadDeadline := time.Now().Add(hc.ReadTimeout)
-		if readDeadline.IsZero() || tmpReadDeadline.Before(readDeadline) {
-			readDeadline = tmpReadDeadline
-		}
-	}
-
-	if err = conn.SetReadDeadline(readDeadline); err != nil {
-		hc.closeConn(cc)
-		return true, err
-	}
-
-	if customSkipBody || req.Header.IsHead() {
-		resp.SkipBody = true
-	}
-	if hc.DisableHeaderNamesNormalizing {
-		resp.Header.DisableNormalizing()
-	}
-
-	br := hc.acquireReader(conn)
-	err = resp.ReadLimitBody(br, hc.MaxResponseBodySize)
-	if err != nil {
-		hc.releaseReader(br)
-		hc.closeConn(cc)
-		// Don't retry in case of ErrBodyTooLarge since we will just get the same again.
-		needRetry := err != ErrBodyTooLarge
-		return needRetry, err
-	}
-
-	closeConn := resetConnection || req.ConnectionClose() || resp.ConnectionClose() || isConnRST
-	if customStreamBody && resp.bodyStream != nil {
-		rbs := resp.bodyStream
-		resp.bodyStream = newCloseReader(rbs, func() error {
-			hc.releaseReader(br)
-			if r, ok := rbs.(*requestStream); ok {
-				releaseRequestStream(r)
-			}
-			if closeConn || resp.ConnectionClose() {
-				hc.closeConn(cc)
-			} else {
-				hc.releaseConn(cc)
-			}
-			return nil
-		})
-		return false, nil
-	} else {
-		hc.releaseReader(br)
-	}
-
-	if closeConn {
-		hc.closeConn(cc)
-	} else {
-		hc.releaseConn(cc)
-	}
-	return false, nil
-}
